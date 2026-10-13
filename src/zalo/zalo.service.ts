@@ -24,10 +24,11 @@ export type LoginState = 'logged_out' | 'waiting_scan' | 'scanned' | 'logged_in'
 @Injectable()
 export class ZaloService implements OnModuleInit {
   private readonly logger = new Logger(ZaloService.name);
-  private readonly zalo = new Zalo({ selfListen: false, checkUpdate: false });
+  private readonly zalo = new Zalo({ selfListen: true, checkUpdate: false });
   private api?: API;
   private state: LoginState = 'logged_out';
   private qrBase64?: string;
+  private loginError?: string;
   private abortLogin?: () => unknown;
   /** groupId -> msgId -> message, filled by the websocket listener. */
   private readonly groupMessages = new Map<string, Map<string, Message>>();
@@ -50,13 +51,42 @@ export class ZaloService implements OnModuleInit {
   }
 
   /** Starts a login if needed, waits for the QR image, and returns it as a PNG. */
+
   async getQr() {
-    if (this.state === 'logged_in') throw new BadRequestException('Already logged in');
-    if (this.state === 'logged_out') this.startLogin();
-    for (let i = 0; i < 50 && !this.qrBase64; i++) {
+    if (this.state === 'logged_in') {
+      throw new BadRequestException('Already logged in');
+    }
+
+    if (this.state === 'logged_out') {
+      this.loginError = undefined;
+      this.startLogin();
+    }
+
+    // Chờ tối đa 20 giây để nhận QR hoặc phát hiện lỗi.
+    const deadline = Date.now() + 20_000;
+
+    while (!this.qrBase64 && Date.now() < deadline) {
+      if (this.loginError) {
+        throw new ServiceUnavailableException(
+          `Zalo login failed: ${this.loginError}`,
+        );
+      }
+
+      if (this.state === 'logged_out') {
+        throw new ServiceUnavailableException(
+          'Zalo login stopped before QR was generated',
+        );
+      }
+
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    if (!this.qrBase64) throw new ServiceUnavailableException('QR not ready, try again');
+
+    if (!this.qrBase64) {
+      throw new ServiceUnavailableException(
+        'QR not ready after 20 seconds. Check server logs.',
+      );
+    }
+
     return Buffer.from(this.qrBase64, 'base64');
   }
 
@@ -69,8 +99,12 @@ export class ZaloService implements OnModuleInit {
       .loginQR({}, async (event) => {
         switch (event.type) {
           case LoginQRCallbackEventType.QRCodeGenerated:
-            this.qrBase64 = event.data.image.replace(/^data:image\/\w+;base64,/, '');
+            this.qrBase64 = event.data.image.replace(
+              /^data:image\/\w+;base64,/,
+              '',
+            );
             this.abortLogin = event.actions.abort;
+            break;
             break;
           case LoginQRCallbackEventType.QRCodeExpired:
             event.actions.retry();
@@ -99,9 +133,39 @@ export class ZaloService implements OnModuleInit {
         this.qrBase64 = undefined;
         this.startListener(api);
       })
-      .catch((e) => {
-        this.logger.error(`QR login failed: ${e}`);
+
+      .catch((e: unknown) => {
+        const err = e instanceof Error ? e : new Error(String(e));
+        const cause = (err as Error & {
+          cause?: {
+            code?: string;
+            message?: string;
+            errno?: number;
+          };
+        }).cause;
+
+        this.loginError = cause?.message ?? err.message;
+
+        this.logger.error(
+          `QR login failed: ${err.message}`,
+          err.stack,
+        );
+
+        this.logger.error(
+          `Fetch cause: ${JSON.stringify(
+            cause
+              ? {
+                name: (cause as Error).name,
+                message: cause.message,
+                code: cause.code,
+                errno: cause.errno,
+              }
+              : null,
+          )}`,
+        );
+
         this.state = 'logged_out';
+        this.qrBase64 = undefined;
       });
     return this.getStatus();
   }
