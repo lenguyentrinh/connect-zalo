@@ -16,6 +16,7 @@
     "rootDir": ".",
     "incremental": true,
     "skipLibCheck": true,
+    "paths": { "zca-js": ["./node_modules/zca-js/dist/index.d.ts"] },
     "strict": true,
     "strictPropertyInitialization": false,
     "types": ["vitest/globals", "node"]
