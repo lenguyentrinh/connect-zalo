@@ -49,8 +49,8 @@ export class ZaloController {
     status: 200,
     description: 'Đã xử lý yêu cầu hủy đăng nhập.',
   })
-  cancelLogin() {
-    this.zalo.cancelLogin();
+  async cancelLogin() {
+    await this.zalo.cancelLogin();
     return this.zalo.getStatus();
   }
 

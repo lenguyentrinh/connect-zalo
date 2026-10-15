@@ -6,7 +6,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { existsSync } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   LoginQRCallbackEventType,
@@ -18,6 +18,7 @@ import {
 } from 'zca-js';
 
 const SESSION_FILE = join(process.cwd(), '.zalo-session.json');
+const MAX_SYNC_PAGES = 20;
 
 export type LoginState = 'logged_out' | 'waiting_scan' | 'scanned' | 'logged_in';
 
@@ -30,8 +31,9 @@ export class ZaloService implements OnModuleInit {
   private qrBase64?: string;
   private loginError?: string;
   private abortLogin?: () => unknown;
-  /** groupId -> msgId -> message, filled by the websocket listener. */
+  /** threadId (group or user) -> msgId -> message, filled by the websocket listener. */
   private readonly groupMessages = new Map<string, Map<string, Message>>();
+  private readonly syncPages = new Map<ThreadType, number>();
 
   async onModuleInit() {
     if (!existsSync(SESSION_FILE)) return;
@@ -170,14 +172,20 @@ export class ZaloService implements OnModuleInit {
     return this.getStatus();
   }
 
-  cancelLogin() {
+  /** Aborts a pending QR login and, if logged in, drops the session, listener and cached messages. */
+  async cancelLogin() {
     this.abortLogin?.();
+    this.api?.listener.stop();
+    this.api = undefined;
     this.state = 'logged_out';
     this.qrBase64 = undefined;
+    this.groupMessages.clear();
+    this.syncPages.clear();
+    await rm(SESSION_FILE, { force: true });
   }
 
   private requireApi(): API {
-    if (!this.api) throw new ServiceUnavailableException('Not logged in to Zalo');
+    if (!this.api || this.state !== 'logged_in') throw new ServiceUnavailableException('Not logged in to Zalo');
     return this.api;
   }
 
@@ -198,18 +206,38 @@ export class ZaloService implements OnModuleInit {
   private startListener(api: API) {
     const { listener } = api;
     listener.on('message', (m) => this.store(m));
-    listener.on('old_messages', (messages) => messages.forEach((m) => this.store(m)));
-    listener.on('connected', () => listener.requestOldMessages(ThreadType.Group));
+    listener.on('old_messages', (messages, type) => {
+      const added = messages.filter((m) => this.store(m)).length;
+      const label = type === ThreadType.Group ? 'group' : 'user';
+      this.logger.log(`Old messages (${label}): received ${messages.length}, new ${added}`);
+      // Page backwards: ask again from the oldest message of this batch until nothing new arrives.
+      const pages = (this.syncPages.get(type) ?? 0) + 1;
+      this.syncPages.set(type, pages);
+      if (added > 0 && pages < MAX_SYNC_PAGES) {
+        const oldest = messages.reduce((a, b) => (Number(a.data.ts) <= Number(b.data.ts) ? a : b));
+        listener.requestOldMessages(type, oldest.data.msgId);
+      }
+    });
+    listener.on('connected', () => this.logger.log('Listener connected, waiting for cipher key'));
+    // Ask for history only after the handshake (cipher key) is done; on `connected` the server may ignore it.
+    listener.on('cipher_key', () => {
+      this.syncPages.clear();
+      this.logger.log('Handshake done, requesting old messages (confirm sync on your phone if asked)');
+      listener.requestOldMessages(ThreadType.Group);
+      listener.requestOldMessages(ThreadType.User);
+    });
     listener.on('error', (e) => this.logger.error(`Listener error: ${e}`));
     listener.on('closed', (code, reason) => this.logger.warn(`Listener closed: ${code} ${reason}`));
     listener.start({ retryOnClose: true });
   }
 
-  private store(message: Message) {
-    if (message.type !== ThreadType.Group) return;
+  /** Returns true if the message was not stored before. */
+  private store(message: Message): boolean {
     let bucket = this.groupMessages.get(message.threadId);
     if (!bucket) this.groupMessages.set(message.threadId, (bucket = new Map()));
+    const isNew = !bucket.has(message.data.msgId);
     bucket.set(message.data.msgId, message);
+    return isNew;
   }
 
   getGroupMessages(groupId: string, count: number) {
