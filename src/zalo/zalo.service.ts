@@ -16,6 +16,8 @@ import {
   type Credentials,
   type Message,
 } from 'zca-js';
+import { GroupRepository } from './group.repository.js';
+import { MessageRepository } from './message.repository.js';
 
 const SESSION_FILE = join(process.cwd(), '.zalo-session.json');
 const MAX_SYNC_PAGES = 20;
@@ -31,9 +33,14 @@ export class ZaloService implements OnModuleInit {
   private qrBase64?: string;
   private loginError?: string;
   private abortLogin?: () => unknown;
-  /** threadId (group or user) -> msgId -> message, filled by the websocket listener. */
-  private readonly groupMessages = new Map<string, Map<string, Message>>();
   private readonly syncPages = new Map<ThreadType, number>();
+  /** Group ids whose name is already saved (or being fetched), to avoid repeated lookups. */
+  private readonly knownGroups = new Set<string>();
+
+  constructor(
+    private readonly messages: MessageRepository,
+    private readonly groups: GroupRepository,
+  ) {}
 
   async onModuleInit() {
     if (!existsSync(SESSION_FILE)) return;
@@ -107,7 +114,6 @@ export class ZaloService implements OnModuleInit {
             );
             this.abortLogin = event.actions.abort;
             break;
-            break;
           case LoginQRCallbackEventType.QRCodeExpired:
             event.actions.retry();
             break;
@@ -179,7 +185,6 @@ export class ZaloService implements OnModuleInit {
     this.api = undefined;
     this.state = 'logged_out';
     this.qrBase64 = undefined;
-    this.groupMessages.clear();
     this.syncPages.clear();
     await rm(SESSION_FILE, { force: true });
   }
@@ -195,19 +200,48 @@ export class ZaloService implements OnModuleInit {
     const ids = Object.keys(gridVerMap);
     if (ids.length === 0) return [];
     const { gridInfoMap } = await api.getGroupInfo(ids);
-    return Object.values(gridInfoMap).map((g) => ({
+    const list = Object.values(gridInfoMap).map((g) => ({
       id: g.groupId,
       name: g.name,
       totalMember: g.totalMember,
     }));
+    await Promise.all(
+      list.map((g) =>
+        this.groups
+          .upsert(g)
+          .then(() => this.knownGroups.add(g.id))
+          .catch((e) => this.logger.error(`Failed to save group ${g.id}: ${e}`)),
+      ),
+    );
+    return list;
   }
 
-  /** Zalo allows one websocket per account; it feeds the in-memory message store. */
+  /** Saves the group's name the first time a message from it is seen. Never throws. */
+  private async ensureGroup(groupId: string) {
+    if (this.knownGroups.has(groupId) || !this.api) return;
+    this.knownGroups.add(groupId);
+    try {
+      const { gridInfoMap } = await this.api.getGroupInfo([groupId]);
+      const g = gridInfoMap[groupId];
+      if (!g) throw new Error('group info not returned');
+      await this.groups.upsert({ id: groupId, name: g.name, totalMember: g.totalMember });
+    } catch (e) {
+      this.knownGroups.delete(groupId);
+      this.logger.warn(`Could not save name of group ${groupId}: ${e}`);
+    }
+  }
+
+  /** Zalo allows one websocket per account; every message it delivers is saved to MySQL. */
   private startListener(api: API) {
     const { listener } = api;
-    listener.on('message', (m) => this.store(m));
-    listener.on('old_messages', (messages, type) => {
-      const added = messages.filter((m) => this.store(m)).length;
+    listener.on('message', (m) => void this.store(m));
+    listener.on('undo', (u) => {
+      this.messages
+        .markRecalled(u.threadId, String(u.data.content.globalMsgId))
+        .catch((e) => this.logger.error(`Failed to mark message recalled: ${e}`));
+    });
+    listener.on('old_messages', async (messages, type) => {
+      const added = (await Promise.all(messages.map((m) => this.store(m)))).filter(Boolean).length;
       const label = type === ThreadType.Group ? 'group' : 'user';
       this.logger.log(`Old messages (${label}): received ${messages.length}, new ${added}`);
       // Page backwards: ask again from the oldest message of this batch until nothing new arrives.
@@ -231,31 +265,24 @@ export class ZaloService implements OnModuleInit {
     listener.start({ retryOnClose: true });
   }
 
-  /** Returns true if the message was not stored before. */
-  private store(message: Message): boolean {
-    let bucket = this.groupMessages.get(message.threadId);
-    if (!bucket) this.groupMessages.set(message.threadId, (bucket = new Map()));
-    const isNew = !bucket.has(message.data.msgId);
-    bucket.set(message.data.msgId, message);
-    return isNew;
+  /** Saves to MySQL; returns true if the message was not stored before. A DB error is logged, never thrown. */
+  private async store(message: Message): Promise<boolean> {
+    try {
+      const isNew = await this.messages.save(message);
+      if (message.type === ThreadType.Group) void this.ensureGroup(message.threadId);
+      return isNew;
+    } catch (e) {
+      this.logger.error(`Failed to save message ${message.data.msgId}: ${e}`);
+      return false;
+    }
   }
 
-  getGroupMessages(groupId: string, count: number) {
-    this.requireApi();
-    const messages = [...(this.groupMessages.get(groupId)?.values() ?? [])]
-      .sort((a, b) => Number(a.data.ts) - Number(b.data.ts))
-      .slice(-count)
-      .map(({ data, isSelf }) => ({
-        id: data.msgId,
-        from: data.uidFrom,
-        fromName: data.dName,
-        isSelf,
-        type: data.msgType,
-        content: data.content,
-        mentions: (data as { mentions?: unknown[] }).mentions ?? [],
-        quote: data.quote?.msg,
-        sentAt: new Date(Number(data.ts)).toISOString(),
-      }));
-    return { count: messages.length, messages };
+  /** Reads from MySQL, so it works without a Zalo login. */
+  async getGroupMessages(groupId: string, count: number, before?: number) {
+    const [group, messages] = await Promise.all([
+      this.groups.findById(groupId),
+      this.messages.findByGroup(groupId, count, before),
+    ]);
+    return { groupId, groupName: group?.name ?? null, count: messages.length, messages };
   }
 }

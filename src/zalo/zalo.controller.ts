@@ -123,7 +123,7 @@ export class ZaloController {
   @ApiOperation({
     summary: 'Lấy tin nhắn của nhóm',
     description:
-      'Lấy tin nhắn theo ID nhóm. Tham số count giới hạn số lượng tin nhắn trả về, tối đa 200.',
+      'Lấy tin nhắn đã lưu trong MySQL theo ID nhóm (không cần đăng nhập Zalo). Tham số count giới hạn số lượng tin nhắn trả về, tối đa 200.',
   })
   @ApiParam({
     name: 'id',
@@ -139,6 +139,12 @@ export class ZaloController {
     description: 'Số lượng tin nhắn cần lấy, mặc định 50, tối thiểu 1, tối đa 200.',
     example: 50,
   })
+  @ApiQuery({
+    name: 'before',
+    required: false,
+    type: Number,
+    description: 'Chỉ lấy tin cũ hơn mốc thời gian này (epoch ms), dùng để phân trang lùi.',
+  })
   @ApiResponse({
     status: 200,
     description: 'Lấy tin nhắn thành công.',
@@ -151,10 +157,13 @@ export class ZaloController {
     @Param('id') id: string,
     @Query('count', new DefaultValuePipe(50), ParseIntPipe)
     count: number,
+    @Query('before', new ParseIntPipe({ optional: true }))
+    before?: number,
   ) {
     return this.zalo.getGroupMessages(
       id,
       Math.min(Math.max(count, 1), 200),
+      before,
     );
   }
 }
